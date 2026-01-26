@@ -4666,3 +4666,5 @@ clientsCoordinates = [
 82483.3333 62250.0000
 ]
 sitesCoordinates = clientsCoordinates
+
+clientsCoordinates, sitesCoordinates

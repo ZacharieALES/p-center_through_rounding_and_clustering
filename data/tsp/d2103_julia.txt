@@ -2105,3 +2105,5 @@ clientsCoordinates = [0.00000e+00 0.00000e+00;
  4.06910e+03 3.24430e+03]
 
 sitesCoordinates = clientsCoordinates
+
+clientsCoordinates, sitesCoordinates

@@ -744715,3 +744715,5 @@ clientsCoordinates2 = [
 ]
 clientsCoordinates = [clientsCoordinates1; clientsCoordinates2]
 sitesCoordinates = clientsCoordinates
+
+clientsCoordinates, sitesCoordinates

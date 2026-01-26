@@ -1404,3 +1404,5 @@ clientsCoordinates = [
 ]
 
 sitesCoordinates = clientsCoordinates
+
+clientsCoordinates, sitesCoordinates

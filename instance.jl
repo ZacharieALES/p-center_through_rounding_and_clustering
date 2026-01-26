@@ -113,7 +113,7 @@ Constructor from an input file
 function Instance(path::String) 
 
     p = 2 # Value used if p is not defined in the file
-    include(path)
+    clientsCoordinates, sitesCoordinates = include(path)
     this = Instance()
     this.p = p
     this.computedDistances = 0
