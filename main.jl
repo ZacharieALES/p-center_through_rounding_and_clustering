@@ -47,6 +47,13 @@ function solveByClusters(instance::Instance; params::ExpeParam=ExpeParam(false),
     end
 
     isClusterUpdated = true
+    
+    # True only when the loop stopped because no client could be removed from the clusters any
+    # more, i.e. when the radius found on the cluster representatives is proved to be the radius
+    # of every client.
+    # Used to avoid considering that the result is optimal when the reason to stop is that there is no time left
+    hasConverged = false
+
     radius = nothing
     dichotomyResults = nothing
     dichotomyTime = 0
@@ -155,11 +162,21 @@ function solveByClusters(instance::Instance; params::ExpeParam=ExpeParam(false),
                     println("Bounds: [", instance.lb, ", ", displayedUB, ", number of distances considered: ", length(instance.of))
                 end 
             end # if dichotomyResults["isOptimal"]
+            if !dichotomyResults["isOptimal"] # If the relaxation could not be solved (time limit, or a set cover without a conclusion). 
+                # Avoid solving it again 
+                break
+            end
         end # while isClusterUpdated && !isOver(time_limit, startingTime) 
 
         isClusterUpdated = false
         
-        ## Integer resolution
+         ## Integer resolution
+        if !isRelaxation && !isOver(time_limit, startingTime) && instance.lb >= instance.ub
+
+            # The bounds already met: the radius is proved, there is nothing left to solve
+            hasConverged = true
+        end
+
         if !isRelaxation && !isOver(time_limit, startingTime) && instance.lb < instance.ub
             println("\n-- Integer resolution (elapsed time ", round(Int, time() - startingTime + initialTimeElapsed), "s)")  
 
@@ -182,6 +199,7 @@ function solveByClusters(instance::Instance; params::ExpeParam=ExpeParam(false),
             if dichotomyResults["isOptimal"]
                 if dichotomyResults["optimalValueFound"] 
                     isClusterUpdated = false
+                    hasConverged = true
 		    instance.lb = radiusOfRepresentatives
 		    instance.ub = radiusOfRepresentatives
                 else
@@ -205,6 +223,7 @@ function solveByClusters(instance::Instance; params::ExpeParam=ExpeParam(false),
 		    try
 			isClusterUpdated, domTime = updateClusters!(instance, radiusOfRepresentatives, openedSitesSolutions, lbImproved, isIntResolution = true, params = params, modulo=modulo, time_limit=remainingTime(time_limit, startingTime), improveModuloUB=improveModuloUB)
                         dominationTime += domTime
+                        hasConverged = !isClusterUpdated
 		    catch e
 		        println("Error: ")
 			rethrow(e)
@@ -242,13 +261,18 @@ function solveByClusters(instance::Instance; params::ExpeParam=ExpeParam(false),
 
     results["dichotomyTime"] = dichotomyTime
     results["clusterUpdateTime"]= clusterUpdateTime
-    results["isOptimal"] = !isRelaxation && !isOver(time_limit, startingTime)
+    results["isOptimal"] = !isRelaxation && !isOver(time_limit, startingTime) && hasConverged
     results["resolutionTime"] = time() - startingTime
     results["alternativeSolutionTime"] = alternativeSolutionsTime
     results["dominationTime"] = dominationTime
     results["n"] = instance.n
     results["p"] = instance.p
-    results["radius"] = instance.ub 
+    results["radius"] = instance.ub
+
+    if !isRelaxation && !hasConverged && !isOver(time_limit, startingTime)
+        println("Warning: the cluster loop stopped before converging although time remained ",
+                "(a set cover could not be solved to a conclusion). The radius is NOT proved optimal.")
+    end
 
     if results["isOptimal"] && !isRelaxation && modulo == 1
         results["dualBound"] = results["radius"]
@@ -257,7 +281,7 @@ function solveByClusters(instance::Instance; params::ExpeParam=ExpeParam(false),
     end 
     
     results["openedSites"] = instance.ubOpenedSites 
-    results["clientsAtTheEnd"] = size(instance.d, 1)
+    results["clientsAtTheEnd"] = instance.dRows
     
     return results
 end 
@@ -303,6 +327,10 @@ function solveByDichotomy(instance::Instance; params::ExpeParam=ExpeParam(false)
     isFirstStep = true
     t = 0
 
+    # True if a set cover could not be solved to a conclusion, in which case the dichotomy is
+    # stopped and its bounds cannot be claimed to be proved
+    isDichotomyAborted = false
+
     lastFeasibleOpenedSites = instance.ubOpenedSites
     alternativeOpenedSites = nothing # Alternative integer solution obtained from a fractional one (use if computeAlternativeRoundedSolution is true)
 
@@ -326,7 +354,16 @@ function solveByDichotomy(instance::Instance; params::ExpeParam=ExpeParam(false)
             optimalValueFound = true
             isFeasible = true
         else
-            isFeasible,  x = areClientsCoverable(instance, instance.of[testedId], isRelaxation=isRelaxation, time_limit=remainingTime(time_limit, startingTime), params = params)
+            isFeasible,  x, isConclusive= areClientsCoverable(instance, instance.of[testedId], isRelaxation=isRelaxation, time_limit=remainingTime(time_limit, startingTime), params = params)
+
+            if !isConclusive
+
+                # Leave the bounds untouched and stop: treating this as infeasible would raise lbId
+                # without proof
+                println("Set cover not solved to a conclusion, stopping the dichotomy")
+                isDichotomyAborted = true
+                break
+            end
 
             if isFeasible
                 ubId = testedId
@@ -350,16 +387,19 @@ function solveByDichotomy(instance::Instance; params::ExpeParam=ExpeParam(false)
     radius = instance.of[lbId]
     
     # If the last set cover was infeasible (i.e., if the lower bound was increased)
-    if !isOver(time_limit, startingTime) && (length(instance.of) == 1 || !isFeasible)
+    if !isDichotomyAborted && !isOver(time_limit, startingTime) && (length(instance.of) == 1 || !isFeasible)
         # Solve the problem for the lower bound
-        isFeasible, x = areClientsCoverable(instance, instance.of[lbId], isRelaxation = isRelaxation, time_limit=remainingTime(time_limit, startingTime), params = params)
+        isFeasible, x, isConclusive = areClientsCoverable(instance, instance.of[lbId], isRelaxation = isRelaxation, time_limit=remainingTime(time_limit, startingTime), params = params)
+        if !isConclusive
+            isDichotomyAborted = true
+        end 
     end
 
     isOptimal = false
 
     results = Dict{String, Any}()
     
-    if !isOver(time_limit, startingTime)
+    if !isDichotomyAborted && !isOver(time_limit, startingTime)
 
         if time_limit == -1 || remainingTime(time_limit, startingTime) > 5
             isOptimal = true
@@ -465,7 +505,7 @@ function areClientsCoverable(instance, distance::Int; isRelaxation::Bool=false, 
     end
     
     if time_limit <= 5 && time_limit != -1
-        return false, x
+        return false, x, false
     else
         if time_limit != -1
             set_optimizer_attribute(m, "CPX_PARAM_TILIM", time_limit)
@@ -483,7 +523,7 @@ function areClientsCoverable(instance, distance::Int; isRelaxation::Bool=false, 
         set_optimizer_attribute(m, "CPX_PARAM_INTSOLLIM", 1)
     end 
 
-    @constraint(m, client[i in 1:size(instance.d, 1)], sum(x[j] for j in 1:instance.m if instance.siteDomination[j] == 0 && instance.d[i, j] <= distance) >= 1)
+    @constraint(m, client[i in 1:instance.dRows], sum(x[j] for j in 1:instance.m if instance.siteDomination[j] == 0 && instance.d[i, j] <= distance) >= 1)
 
     if params.usePMaxConstraint || params.useNullObjective
         @constraint(m, sum(x[j] for j in 1:instance.m if instance.siteDomination[j] == 0) <= instance.p)
@@ -491,18 +531,37 @@ function areClientsCoverable(instance, distance::Int; isRelaxation::Bool=false, 
 
     isCoverable = false
 
+    # True if the answer is a proof. False if the set cover was interrupted (e.g., time limit)
+    # Reporting it as "not coverable" would raise the lower bound of the
+    # dichotomy without any proof
+    isConclusive = true
+
     try
         optimize!(m)
     catch e
-        println("error while solving dichotomy")
-        return isCoverable, x
+        println("error while solving the set cover: ", sprint(showerror, e))
+        return false, x, false
     end    
-    
-    if primal_status(m) == MOI.FEASIBLE_POINT
-        isCoverable = JuMP.objective_value(m) <= instance.p + 10^-3
+
+    status = termination_status(m)
+
+     if primal_status(m) == MOI.FEASIBLE_POINT
+         isCoverable = JuMP.objective_value(m) <= instance.p + 10^-3
+
+        # A solution using more than p sites only proves that the clients are not coverable if the
+        # search finished; if CPLEX stopped early, a cover with <= p sites may still exist
+        if !isCoverable && status != MOI.OPTIMAL && status != MOI.OBJECTIVE_LIMIT
+            isConclusive = false
+        end
+    else
+
+        # No solution found: only CPLEX proving infeasibility (or cutting everything off with the
+        # cutoff set to p) shows that the clients are not coverable
+        isConclusive = status == MOI.INFEASIBLE || status == MOI.INFEASIBLE_OR_UNBOUNDED || status == MOI.OBJECTIVE_LIMIT
     end
 
-    return isCoverable, x
+    return isCoverable, x, isConclusive
+
 end  
 
 """
@@ -626,20 +685,15 @@ function solveByModuloClusters(instance::Instance; params::ExpeParam=ExpeParam(f
         push!(resolutionTimeByIterations, time() - iterationStartingTime)
     end 
 
-    results["isOptimal"] = !isOver(time_limit, startingTime)
-    results["radius"] = clusterResults["radius"]
+    results["isOptimal"] = instance.lb >= instance.ub
+    results["radius"] = instance.moduloUB
     results["resolutionTime"] = time()-startingTime
     results["resolutionTimeByIterations"] = resolutionTimeByIterations
     results["openedSites"] = instance.moduloOpenedSites
     results["n"] = instance.n
-    results["clientsAtTheEnd"] = size(instance.d, 1)
+    results["clientsAtTheEnd"] = instance.dRows
+    results["dualBound"] = instance.lb
     
-    if results["isOptimal"] && !isRelaxation
-        results["dualBound"] = results["radius"]
-    else
-        results["dualBound"] = instance.lb
-    end
-
     return results
 end
 

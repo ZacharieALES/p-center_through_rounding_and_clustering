@@ -35,6 +35,7 @@ mutable struct Instance
     clientsCoordinates::Matrix{Float64} # clientsCoordinates[:, i] are the coordinates of the ith client
     clusters::Vector{Cluster}
     d::Matrix{Int64} # Distance matrix d[i, j] = distance between cluster i and site j
+    dRows::Int # Number of rows of d in use (i.e., number of clusters whose distances are in d)    
     of::Vector{Int64} # Ordered distances between clients and sites
 
     computedDistances::Int
@@ -112,11 +113,11 @@ Constructor from an input file
 """
 function Instance(path::String) 
 
-    p = 2 # Value used if p is not defined in the file
-    clientsCoordinates, sitesCoordinates = include(path)
+    clientsCoordinates, sitesCoordinates, p = readInstanceFile(path)
     this = Instance()
     this.p = p
     this.computedDistances = 0
+    this.dRows = 0
     this.clientsCoordinates = transpose(clientsCoordinates)
     this.sitesCoordinates = transpose(sitesCoordinates)
     this.n = size(this.clientsCoordinates, 2)
@@ -148,6 +149,162 @@ function Instance(path::String)
 end
 
 """
+Append to `values` the coordinates found in `content`, a piece of a coordinate block such as
+"12661.6667 86437.2222; 12162.5000 86755.0000". Returns the number of rows appended.
+"""
+function appendCoordinates!(values::Vector{Float64}, content::AbstractString)
+
+    rowCount = 0
+
+    for rowString in split(content, ';')
+        row = strip(rowString)
+        if isempty(row)
+            continue
+        end 
+
+        valueCountBefore = length(values)
+        for token in split(row)
+            push!(values, parse(Float64, token))
+        end
+
+        if length(values) - valueCountBefore != 2
+            error("expected 2 coordinates per row, got \"", row, "\"")
+        end
+        rowCount += 1
+    end
+
+    return rowCount
+end
+
+"""
+Resolve the coordinates named `name`, following concatenations and aliases.
+"""
+function resolveCoordinates(name::AbstractString, blocks::Dict{String, Matrix{Float64}},
+                            concatenations::Dict{String, Vector{String}},
+                            aliases::Dict{String, String}, depth::Int = 0)
+
+    if depth > 10
+        error("cycle while resolving \"", name, "\" in the instance file")
+    end 
+
+    if haskey(blocks, name)
+        return blocks[name]
+    end 
+
+    if haskey(concatenations, name)
+        return reduce(vcat, [resolveCoordinates(part, blocks, concatenations, aliases, depth + 1)
+                             for part in concatenations[name]])
+    end
+
+    if haskey(aliases, name)
+        return resolveCoordinates(aliases[name], blocks, concatenations, aliases, depth + 1)
+    end 
+
+    error("\"", name, "\" is not defined in the instance file")
+end
+
+"""
+Read an instance file and return (clientsCoordinates, sitesCoordinates, p), the coordinates being
+one row per point as they appear in the file.
+
+Supported forms:
+    n = 3496                          scalar
+    clientsCoordinates = [            coordinate block, possibly spanning many lines
+       12661.6667 86437.2222;
+       ... ]
+    sitesCoordinates = clientsCoordinates              alias
+    clientsCoordinates = [part1; part2; part3]         concatenation of blocks defined above
+"""
+function readInstanceFile(path::String)
+
+    blocks = Dict{String, Matrix{Float64}}()
+    concatenations = Dict{String, Vector{String}}()
+    aliases = Dict{String, String}()
+    scalars = Dict{String, Int}()
+
+    # Block currently being read ("" when we are not inside a block)
+    currentName = ""
+    values = Vector{Float64}()
+    rowCount = 0
+
+    function closeBlock!()
+        blocks[currentName] = permutedims(reshape(values, 2, rowCount))
+        currentName = ""
+        values = Vector{Float64}()
+        rowCount = 0
+    end
+
+    for rawLine in eachline(path)
+        line = strip(rawLine)
+        if (isempty(line) || startswith(line, "#"))
+            continue
+        end 
+
+        if currentName != ""
+
+            # Inside a coordinate block: it ends with the line holding the closing bracket
+            content = line
+            isClosed = endswith(content, "]")
+            if isClosed
+                content = content[1:prevind(content, lastindex(content))]
+            end 
+            rowCount += appendCoordinates!(values, content)
+            if isClosed
+                closeBlock!()
+            end 
+            continue
+        end
+
+        assignment = match(r"^(\w+)\s*=\s*(.*)$", line)
+        if assignment === nothing
+            continue
+        end 
+        name = String(assignment.captures[1])
+        rhs = strip(assignment.captures[2])
+
+        if startswith(rhs, "[")
+            content = rhs[nextind(rhs, firstindex(rhs)):end]
+            isClosed = endswith(content, "]")
+            if isClosed
+                content = content[1:prevind(content, lastindex(content))]
+            end 
+
+            parts = filter(!isempty, strip.(split(content, r"[;,]")))
+
+            # [part1; part2] : a concatenation of blocks defined earlier.
+            # Every part must be a bare identifier: testing for the mere presence of a letter would
+            # misread a coordinate written in scientific notation ("0.00000e+00") as a block name.
+            if !isempty(parts) && all(part -> occursin(r"^[A-Za-z_]\w*$", part), parts)
+
+                concatenations[name] = String.(parts)
+            else
+                currentName = name
+                rowCount += appendCoordinates!(values, content)
+                if isClosed
+                    closeBlock!()
+                end 
+            end
+        elseif occursin(r"^-?\d+$", rhs)
+            scalars[name] = parse(Int, rhs)
+        elseif occursin(r"^\w+$", rhs)
+            aliases[name] = String(rhs)
+        end
+    end
+
+    if currentName != ""
+        error("unterminated block \"", currentName, "\" in ", path)
+    end 
+
+    clientsCoordinates = resolveCoordinates("clientsCoordinates", blocks, concatenations, aliases)
+    sitesCoordinates = resolveCoordinates("sitesCoordinates", blocks, concatenations, aliases)
+
+    # p is optional in the instance files
+    p = get(scalars, "p", 2)
+
+    return clientsCoordinates, sitesCoordinates, p
+end
+
+"""
 Create one cluster for each client
 """
 function createUnitaryClusters(instance)
@@ -159,12 +316,61 @@ function createUnitaryClusters(instance)
 end
 
 """
+Maximal amount of spare capacity allocated at once when the distance matrix grows.
+
+The matrix gains rows as clusters are disaggregated. Reallocating it at every disaggregation
+copies the whole matrix each time, which is quadratic in the number of rounds, so capacity is
+allocated in advance instead. Plain doubling cannot be used: one row is 8*m bytes, i.e. about
+6 MB when m = 750000, so doubling from 2000 rows would ask for 12 GB on top of the 12 GB already
+allocated. Growth is therefore geometric only while the spare capacity stays within this budget,
+and linear (by this many bytes) beyond it.
+"""
+const MAX_SPARE_CAPACITY_BYTES = 256 * 1024 * 1024
+
+"""
+Set to `rowCount` the number of rows of instance.d which are in use, allocating more capacity if
+needed. The values already in the matrix are preserved and the new rows are set to zero.
+"""
+function setDRows!(instance::Instance, rowCount::Int)
+
+    capacity = size(instance.d, 1)
+
+    if rowCount > capacity
+
+        rowBytes = 8 * instance.m
+        maxSpareRows = max(1, div(MAX_SPARE_CAPACITY_BYTES, max(rowBytes, 1)))
+
+        # Geometric growth, capped so that at most MAX_SPARE_CAPACITY_BYTES is allocated at once
+        newCapacity = max(rowCount, min(2 * capacity, capacity + maxSpareRows))
+
+        newD = Matrix{Int64}(undef, newCapacity, instance.m)
+        copyto!(view(newD, 1:instance.dRows, :), view(instance.d, 1:instance.dRows, :))
+        instance.d = newD
+    end
+
+    if rowCount > instance.dRows
+        fill!(view(instance.d, instance.dRows+1:rowCount, :), 0)
+    end
+
+    instance.dRows = rowCount
+end
+
+"""
 Initialize matrix "d" and vector "of" according to the clusters of the instance
 """
 function initializeDandOf!(instance::Instance, params::ExpeParam; modulo::Int=1, time_limit::Int=-1)
 
-    # Initialize instance.d
-    instance.d = Matrix{Int64}(zeros(length(instance.clusters), instance.m))
+    # Initialize instance.d, reusing the capacity already allocated if there is enough of it
+    # (this function is called once per modulo iteration, on clusters which keep growing)
+    clusterCount = length(instance.clusters)
+
+    if isdefined(instance, :d) && size(instance.d, 2) == instance.m && size(instance.d, 1) >= clusterCount
+        instance.dRows = 0
+        setDRows!(instance, clusterCount)
+    else
+        instance.d = Matrix{Int64}(zeros(clusterCount, instance.m))
+        instance.dRows = clusterCount
+    end
 
     startingUpdateTime = time()
 
@@ -190,13 +396,20 @@ function initializeDandOf!(instance::Instance, params::ExpeParam; modulo::Int=1,
     if !isOver(time_limit,startingUpdateTime) 
         for siteId in 1:instance.m
 
+ 
             # Add the distance between the site and the cluster only if the cluster is not dominated
-            if !instance.areClientsIdenticalToSites && instance.siteDomination[siteId] == 0
+            if instance.siteDomination[siteId] == 0
                 for cId in 1:length(instance.clusters)
                     push!(distances, instance.d[cId, siteId])
                 end 
             end 
         end
+    end
+
+    # of must never be empty: solveByDichotomy indexes of[1] before doing anything else.
+    # It would be empty if the time limit interrupted the loop above.
+    if isempty(distances)
+        push!(distances, max(instance.lb, 0))
     end
     instance.of = Vector{Int64}(undef, length(distances))
 
@@ -223,8 +436,8 @@ function isSiteDominated(instance::Instance, idSite1::Int64, idSite2::Int64; sta
     clusterId = startingCluster
 
     # While all the clients have not been tested and site 1 is dominated by site 2
-    # (use size(instance.d, 1) rather than length(instance.clusters) since when new clusters are created their distances have not yet been added in instance.d. It is not useful to test the distances to the new clusters in that case since we only test if non dominated sites become dominated and adding client cannot make them dominated)
-    while clusterId <= size(instance.d, 1) && isS1Dominated
+    # (use instance.dRows rather than length(instance.clusters) since when new clusters are created their distances have not yet been added in instance.d. It is not useful to test the distances to the new clusters in that case since we only test if non dominated sites become dominated and adding client cannot make them dominated)
+    while clusterId <= instance.dRows && isS1Dominated
 
         if instance.d[clusterId, idSite2] != instance.lb && instance.d[clusterId, idSite1] < instance.d[clusterId, idSite2]
             isS1Dominated = false
@@ -396,7 +609,8 @@ function updateClusters!(instance::Instance, radiusOfRepresentatives::Int64, ope
     if newClustersCreated
 
         # Update d and of for the new clusters
-        instance.d = vcat(instance.d, zeros(length(instance.clusters) - previousClusterCount, instance.m))  
+        # (rows are taken from the spare capacity of d, so most of the time nothing is copied)
+        setDRows!(instance, length(instance.clusters))
 
         for newClusterId in previousClusterCount+1:length(instance.clusters)
 
@@ -479,7 +693,7 @@ function updateClusters!(instance::Instance, radiusOfRepresentatives::Int64, ope
            end
            if site1BecameNonDominated
                
-               for (viewIdSite2, site2BecameNonDominated) in enumerate(@view becameNonDominated[idSite1+1])
+               for (viewIdSite2, site2BecameNonDominated) in enumerate(@view becameNonDominated[idSite1+1:end])
                    idSite2 = viewIdSite2+idSite1
                    if site2BecameNonDominated && isSiteDominated(instance, idSite1, idSite2)
                        instance.siteDomination[idSite1] = idSite2
@@ -687,7 +901,7 @@ function setLB!(instance::Instance, lb::Int64, params::ExpeParam)
         if jDomination == 0
             
             # For each cluster
-            for c in 1:size(instance.d, 1)
+            for c in 1:instance.dRows
 
                 if instance.d[c, j] < lb
                     instance.d[c, j] = lb
@@ -717,7 +931,7 @@ function setUB!(instance::Instance, ub::Int64, openedSites::Vector{Int64}, param
         if jDomination == 0
             
             # For each cluster
-            for c in 1:size(instance.d, 1)
+            for c in 1:instance.dRows
                 if instance.d[c, j] > ub + 1
                     instance.d[c, j] = ub + 1
                 end
@@ -883,14 +1097,17 @@ function updateRepresentative!(c::Cluster, instance::Instance)
 
         distToBarycenters[1] = closestDistance
 
-        for (clientClusterId, clientId) in enumerate(@view c.clientsId[2:end])
+        # enumerate starts at 1 on the view, while the client it yields sits at position viewId+1
+        # in c.clientsId: distToBarycenters must be indexed by the position, not by the view index
+        for (viewId, clientId) in enumerate(@view c.clientsId[2:end])
+            clientClusterId = viewId + 1
             dist = abs(barycentreX - instance.clientsCoordinates[1, clientId])^2 + abs(barycentreY - instance.clientsCoordinates[2, clientId])^2
             
             distToBarycenters[clientClusterId] = dist
 
             if dist < closestDistance
                 closestDistance = dist
-                closestClientClusterId = clientClusterId+1
+                closestClientClusterId = clientClusterId
             end 
         end
 
